@@ -104,6 +104,7 @@ use codex_app_server_protocol::TurnStartedNotification;
 use codex_app_server_protocol::TurnStatus;
 use codex_app_server_protocol::build_turns_from_rollout_items;
 use codex_app_server_protocol::convert_patch_changes;
+use codex_app_server_protocol::guardian_command_execution_projection;
 use codex_core::CodexThread;
 use codex_core::ThreadManager;
 use codex_core::find_thread_name_by_id;
@@ -153,10 +154,83 @@ enum CommandExecutionApprovalPresentation {
     Command(CommandExecutionCompletionItem),
 }
 
+#[derive(Debug, PartialEq)]
 struct CommandExecutionCompletionItem {
     command: String,
     cwd: PathBuf,
     command_actions: Vec<V2ParsedCommand>,
+}
+
+fn synthetic_command_execution_item(
+    item_id: String,
+    command: String,
+    cwd: PathBuf,
+    command_actions: Vec<V2ParsedCommand>,
+    source: CommandExecutionSource,
+    status: CommandExecutionStatus,
+) -> ThreadItem {
+    ThreadItem::CommandExecution {
+        id: item_id,
+        command,
+        cwd,
+        process_id: None,
+        source,
+        status,
+        command_actions,
+        aggregated_output: None,
+        exit_code: None,
+        duration_ms: None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn start_command_execution_item_once(
+    conversation_id: &ThreadId,
+    turn_id: String,
+    item_id: String,
+    command: String,
+    cwd: PathBuf,
+    command_actions: Vec<V2ParsedCommand>,
+    source: CommandExecutionSource,
+    outgoing: &ThreadScopedOutgoingMessageSender,
+    thread_state: &Arc<Mutex<ThreadState>>,
+) -> bool {
+    let first_start = {
+        let mut state = thread_state.lock().await;
+        state
+            .turn_summary
+            .command_execution_started
+            .insert(item_id.clone())
+    };
+    if first_start {
+        let notification = ItemStartedNotification {
+            thread_id: conversation_id.to_string(),
+            turn_id,
+            item: synthetic_command_execution_item(
+                item_id,
+                command,
+                cwd,
+                command_actions,
+                source,
+                CommandExecutionStatus::InProgress,
+            ),
+        };
+        outgoing
+            .send_server_notification(ServerNotification::ItemStarted(notification))
+            .await;
+    }
+    first_start
+}
+
+fn guardian_pending_command_execution_item(
+    assessment: &GuardianAssessmentEvent,
+) -> Option<CommandExecutionCompletionItem> {
+    let projection = guardian_command_execution_projection(assessment)?;
+    Some(CommandExecutionCompletionItem {
+        command: projection.command,
+        cwd: projection.cwd,
+        command_actions: projection.command_actions,
+    })
 }
 
 async fn resolve_server_request_on_thread_listener(
@@ -347,12 +421,57 @@ pub(crate) async fn apply_bespoke_event_handling(
         EventMsg::Warning(_warning_event) => {}
         EventMsg::GuardianAssessment(assessment) => {
             if let ApiVersion::V2 = api_version {
+                let pending_command_execution =
+                    guardian_pending_command_execution_item(&assessment);
+                let assessment_turn_id = if assessment.turn_id.is_empty() {
+                    event_turn_id.clone()
+                } else {
+                    assessment.turn_id.clone()
+                };
+                if assessment.status
+                    == codex_protocol::protocol::GuardianAssessmentStatus::InProgress
+                    && let Some(completion_item) = pending_command_execution.as_ref()
+                {
+                    start_command_execution_item_once(
+                        &conversation_id,
+                        assessment_turn_id.clone(),
+                        assessment.id.clone(),
+                        completion_item.command.clone(),
+                        completion_item.cwd.clone(),
+                        completion_item.command_actions.clone(),
+                        CommandExecutionSource::Agent,
+                        &outgoing,
+                        &thread_state,
+                    )
+                    .await;
+                }
                 let notification = guardian_auto_approval_review_notification(
                     &conversation_id,
                     &event_turn_id,
                     &assessment,
                 );
                 outgoing.send_server_notification(notification).await;
+                if matches!(
+                    assessment.status,
+                    codex_protocol::protocol::GuardianAssessmentStatus::Denied
+                        | codex_protocol::protocol::GuardianAssessmentStatus::Aborted
+                ) && let Some(completion_item) = pending_command_execution
+                {
+                    complete_command_execution_item(
+                        &conversation_id,
+                        assessment_turn_id,
+                        assessment.id.clone(),
+                        completion_item.command,
+                        completion_item.cwd,
+                        /*process_id*/ None,
+                        CommandExecutionSource::Agent,
+                        completion_item.command_actions,
+                        CommandExecutionStatus::Declined,
+                        &outgoing,
+                        &thread_state,
+                    )
+                    .await;
+                }
             }
         }
         EventMsg::ModelReroute(event) => {
@@ -671,6 +790,22 @@ pub(crate) async fn apply_bespoke_event_handling(
                                 Some(completion_item),
                             ),
                         };
+                    if approval_id.is_none()
+                        && let Some(completion_item) = completion_item.as_ref()
+                    {
+                        start_command_execution_item_once(
+                            &conversation_id,
+                            event_turn_id.clone(),
+                            call_id.clone(),
+                            completion_item.command.clone(),
+                            completion_item.cwd.clone(),
+                            completion_item.command_actions.clone(),
+                            CommandExecutionSource::Agent,
+                            &outgoing,
+                            &thread_state,
+                        )
+                        .await;
+                    }
                     let proposed_execpolicy_amendment_v2 =
                         proposed_execpolicy_amendment.map(V2ExecPolicyAmendment::from);
                     let proposed_network_policy_amendments_v2 = proposed_network_policy_amendments
@@ -1611,35 +1746,35 @@ pub(crate) async fn apply_bespoke_event_handling(
             let command = shlex_join(&exec_command_begin_event.command);
             let cwd = exec_command_begin_event.cwd;
             let process_id = exec_command_begin_event.process_id;
-
-            {
+            let first_start = {
                 let mut state = thread_state.lock().await;
                 state
                     .turn_summary
                     .command_execution_started
-                    .insert(item_id.clone());
+                    .insert(item_id.clone())
+            };
+            if first_start {
+                let item = ThreadItem::CommandExecution {
+                    id: item_id,
+                    command,
+                    cwd,
+                    process_id,
+                    source: exec_command_begin_event.source.into(),
+                    status: CommandExecutionStatus::InProgress,
+                    command_actions,
+                    aggregated_output: None,
+                    exit_code: None,
+                    duration_ms: None,
+                };
+                let notification = ItemStartedNotification {
+                    thread_id: conversation_id.to_string(),
+                    turn_id: event_turn_id.clone(),
+                    item,
+                };
+                outgoing
+                    .send_server_notification(ServerNotification::ItemStarted(notification))
+                    .await;
             }
-
-            let item = ThreadItem::CommandExecution {
-                id: item_id,
-                command,
-                cwd,
-                process_id,
-                source: exec_command_begin_event.source.into(),
-                status: CommandExecutionStatus::InProgress,
-                command_actions,
-                aggregated_output: None,
-                exit_code: None,
-                duration_ms: None,
-            };
-            let notification = ItemStartedNotification {
-                thread_id: conversation_id.to_string(),
-                turn_id: event_turn_id.clone(),
-                item,
-            };
-            outgoing
-                .send_server_notification(ServerNotification::ItemStarted(notification))
-                .await;
         }
         EventMsg::ExecCommandOutputDelta(exec_command_output_delta_event) => {
             let item_id = exec_command_output_delta_event.call_id.clone();
@@ -1996,7 +2131,7 @@ async fn complete_file_change_item(
 
 #[allow(clippy::too_many_arguments)]
 async fn complete_command_execution_item(
-    conversation_id: ThreadId,
+    conversation_id: &ThreadId,
     turn_id: String,
     item_id: String,
     command: String,
@@ -2006,7 +2141,18 @@ async fn complete_command_execution_item(
     command_actions: Vec<V2ParsedCommand>,
     status: CommandExecutionStatus,
     outgoing: &ThreadScopedOutgoingMessageSender,
+    thread_state: &Arc<Mutex<ThreadState>>,
 ) {
+    let mut state = thread_state.lock().await;
+    let should_emit = state
+        .turn_summary
+        .command_execution_started
+        .remove(&item_id);
+    drop(state);
+    if !should_emit {
+        return;
+    }
+
     let item = ThreadItem::CommandExecution {
         id: item_id,
         command,
@@ -2713,7 +2859,7 @@ async fn on_command_execution_request_approval_response(
         && let Some(completion_item) = completion_item
     {
         complete_command_execution_item(
-            conversation_id,
+            &conversation_id,
             event_turn_id.clone(),
             item_id.clone(),
             completion_item.command,
@@ -2723,6 +2869,7 @@ async fn on_command_execution_request_approval_response(
             completion_item.command_actions,
             status,
             &outgoing,
+            &thread_state,
         )
         .await;
     }
@@ -2884,6 +3031,7 @@ mod tests {
     use rmcp::model::Content;
     use serde_json::Value as JsonValue;
     use serde_json::json;
+    use std::path::PathBuf;
     use std::time::Duration;
     use tokio::sync::Mutex;
     use tokio::sync::mpsc;
@@ -2902,6 +3050,16 @@ mod tests {
         match envelope {
             OutgoingEnvelope::Broadcast { message } => Ok(message),
             OutgoingEnvelope::ToConnection { message, .. } => Ok(message),
+        }
+    }
+
+    fn command_execution_completion_item(command: &str) -> CommandExecutionCompletionItem {
+        CommandExecutionCompletionItem {
+            command: command.to_string(),
+            cwd: PathBuf::from("/tmp"),
+            command_actions: vec![V2ParsedCommand::Unknown {
+                command: command.to_string(),
+            }],
         }
     }
 
@@ -3022,6 +3180,389 @@ mod tests {
             }
             other => panic!("unexpected notification: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn command_execution_started_helper_emits_once() -> Result<()> {
+        let conversation_id = ThreadId::new();
+        let thread_state = new_thread_state();
+        let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let outgoing = Arc::new(OutgoingMessageSender::new(tx));
+        let outgoing = ThreadScopedOutgoingMessageSender::new(
+            outgoing,
+            vec![ConnectionId(1)],
+            ThreadId::new(),
+        );
+        let completion_item = command_execution_completion_item("printf hi");
+
+        let first_start = start_command_execution_item_once(
+            &conversation_id,
+            "turn-1".to_string(),
+            "cmd-1".to_string(),
+            completion_item.command.clone(),
+            completion_item.cwd.clone(),
+            completion_item.command_actions.clone(),
+            CommandExecutionSource::Agent,
+            &outgoing,
+            &thread_state,
+        )
+        .await;
+        assert!(first_start);
+
+        let msg = recv_broadcast_message(&mut rx).await?;
+        match msg {
+            OutgoingMessage::AppServerNotification(ServerNotification::ItemStarted(payload)) => {
+                assert_eq!(payload.thread_id, conversation_id.to_string());
+                assert_eq!(payload.turn_id, "turn-1");
+                assert_eq!(
+                    payload.item,
+                    synthetic_command_execution_item(
+                        "cmd-1".to_string(),
+                        completion_item.command.clone(),
+                        completion_item.cwd.clone(),
+                        completion_item.command_actions.clone(),
+                        CommandExecutionSource::Agent,
+                        CommandExecutionStatus::InProgress,
+                    )
+                );
+            }
+            other => bail!("unexpected message: {other:?}"),
+        }
+
+        let second_start = start_command_execution_item_once(
+            &conversation_id,
+            "turn-1".to_string(),
+            "cmd-1".to_string(),
+            completion_item.command.clone(),
+            completion_item.cwd.clone(),
+            completion_item.command_actions.clone(),
+            CommandExecutionSource::Agent,
+            &outgoing,
+            &thread_state,
+        )
+        .await;
+        assert!(!second_start);
+        assert!(rx.try_recv().is_err(), "duplicate start should not emit");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn complete_command_execution_item_emits_declined_once_for_pending_command() -> Result<()>
+    {
+        let conversation_id = ThreadId::new();
+        let thread_state = new_thread_state();
+        let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let outgoing = Arc::new(OutgoingMessageSender::new(tx));
+        let outgoing = ThreadScopedOutgoingMessageSender::new(
+            outgoing,
+            vec![ConnectionId(1)],
+            ThreadId::new(),
+        );
+        let completion_item = command_execution_completion_item("printf hi");
+
+        start_command_execution_item_once(
+            &conversation_id,
+            "turn-1".to_string(),
+            "cmd-1".to_string(),
+            completion_item.command.clone(),
+            completion_item.cwd.clone(),
+            completion_item.command_actions.clone(),
+            CommandExecutionSource::Agent,
+            &outgoing,
+            &thread_state,
+        )
+        .await;
+        let _started = recv_broadcast_message(&mut rx).await?;
+
+        complete_command_execution_item(
+            &conversation_id,
+            "turn-1".to_string(),
+            "cmd-1".to_string(),
+            completion_item.command.clone(),
+            completion_item.cwd.clone(),
+            /*process_id*/ None,
+            CommandExecutionSource::Agent,
+            completion_item.command_actions.clone(),
+            CommandExecutionStatus::Declined,
+            &outgoing,
+            &thread_state,
+        )
+        .await;
+
+        let completed = recv_broadcast_message(&mut rx).await?;
+        match completed {
+            OutgoingMessage::AppServerNotification(ServerNotification::ItemCompleted(payload)) => {
+                let ThreadItem::CommandExecution { id, status, .. } = payload.item else {
+                    bail!("expected command execution completion");
+                };
+                assert_eq!(id, "cmd-1");
+                assert_eq!(status, CommandExecutionStatus::Declined);
+            }
+            other => bail!("unexpected message: {other:?}"),
+        }
+
+        complete_command_execution_item(
+            &conversation_id,
+            "turn-1".to_string(),
+            "cmd-1".to_string(),
+            completion_item.command,
+            completion_item.cwd,
+            /*process_id*/ None,
+            CommandExecutionSource::Agent,
+            completion_item.command_actions,
+            CommandExecutionStatus::Declined,
+            &outgoing,
+            &thread_state,
+        )
+        .await;
+        assert!(
+            rx.try_recv().is_err(),
+            "completion should not emit after the pending item is cleared"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn guardian_command_execution_notifications_wrap_review_lifecycle() -> Result<()> {
+        let conversation_id = ThreadId::new();
+        let thread_state = new_thread_state();
+        let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let outgoing = Arc::new(OutgoingMessageSender::new(tx));
+        let outgoing = ThreadScopedOutgoingMessageSender::new(
+            outgoing,
+            vec![ConnectionId(1)],
+            ThreadId::new(),
+        );
+        let in_progress = GuardianAssessmentEvent {
+            id: "cmd-guardian".to_string(),
+            turn_id: "turn-guardian".to_string(),
+            status: codex_protocol::protocol::GuardianAssessmentStatus::InProgress,
+            risk_score: None,
+            risk_level: None,
+            rationale: None,
+            action: Some(
+                serde_json::from_value(json!({
+                    "tool": "exec_command",
+                    "command": "/bin/zsh -lc 'rm -f /tmp/file.sqlite'",
+                    "cwd": "/tmp",
+                }))
+                .expect("guardian action"),
+            ),
+        };
+        let completion_item =
+            guardian_pending_command_execution_item(&in_progress).expect("command-like action");
+        start_command_execution_item_once(
+            &conversation_id,
+            in_progress.turn_id.clone(),
+            in_progress.id.clone(),
+            completion_item.command.clone(),
+            completion_item.cwd.clone(),
+            completion_item.command_actions.clone(),
+            CommandExecutionSource::Agent,
+            &outgoing,
+            &thread_state,
+        )
+        .await;
+        outgoing
+            .send_server_notification(guardian_auto_approval_review_notification(
+                &conversation_id,
+                &in_progress.turn_id,
+                &in_progress,
+            ))
+            .await;
+
+        let first = recv_broadcast_message(&mut rx).await?;
+        match first {
+            OutgoingMessage::AppServerNotification(ServerNotification::ItemStarted(payload)) => {
+                assert_eq!(payload.turn_id, "turn-guardian");
+                let ThreadItem::CommandExecution { id, status, .. } = payload.item else {
+                    bail!("expected synthetic command execution item");
+                };
+                assert_eq!(id, "cmd-guardian");
+                assert_eq!(status, CommandExecutionStatus::InProgress);
+            }
+            other => bail!("unexpected message: {other:?}"),
+        }
+
+        let second = recv_broadcast_message(&mut rx).await?;
+        match second {
+            OutgoingMessage::AppServerNotification(
+                ServerNotification::ItemGuardianApprovalReviewStarted(payload),
+            ) => {
+                assert_eq!(payload.target_item_id, "cmd-guardian");
+                assert_eq!(
+                    payload.review.status,
+                    GuardianApprovalReviewStatus::InProgress
+                );
+            }
+            other => bail!("unexpected message: {other:?}"),
+        }
+
+        let denied = GuardianAssessmentEvent {
+            id: "cmd-guardian".to_string(),
+            turn_id: "turn-guardian".to_string(),
+            status: codex_protocol::protocol::GuardianAssessmentStatus::Denied,
+            risk_score: Some(88),
+            risk_level: Some(codex_protocol::protocol::GuardianRiskLevel::High),
+            rationale: Some("too risky".to_string()),
+            action: in_progress.action.clone(),
+        };
+        outgoing
+            .send_server_notification(guardian_auto_approval_review_notification(
+                &conversation_id,
+                &denied.turn_id,
+                &denied,
+            ))
+            .await;
+        complete_command_execution_item(
+            &conversation_id,
+            denied.turn_id.clone(),
+            denied.id.clone(),
+            completion_item.command,
+            completion_item.cwd,
+            /*process_id*/ None,
+            CommandExecutionSource::Agent,
+            completion_item.command_actions,
+            CommandExecutionStatus::Declined,
+            &outgoing,
+            &thread_state,
+        )
+        .await;
+
+        let third = recv_broadcast_message(&mut rx).await?;
+        match third {
+            OutgoingMessage::AppServerNotification(
+                ServerNotification::ItemGuardianApprovalReviewCompleted(payload),
+            ) => {
+                assert_eq!(payload.target_item_id, "cmd-guardian");
+                assert_eq!(payload.review.status, GuardianApprovalReviewStatus::Denied);
+            }
+            other => bail!("unexpected message: {other:?}"),
+        }
+
+        let fourth = recv_broadcast_message(&mut rx).await?;
+        match fourth {
+            OutgoingMessage::AppServerNotification(ServerNotification::ItemCompleted(payload)) => {
+                let ThreadItem::CommandExecution { id, status, .. } = payload.item else {
+                    bail!("expected synthetic command execution completion");
+                };
+                assert_eq!(id, "cmd-guardian");
+                assert_eq!(status, CommandExecutionStatus::Declined);
+            }
+            other => bail!("unexpected message: {other:?}"),
+        }
+        assert!(rx.try_recv().is_err(), "no extra messages expected");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn guardian_approved_review_does_not_complete_synthetic_command_item() -> Result<()> {
+        let conversation_id = ThreadId::new();
+        let thread_state = new_thread_state();
+        let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let outgoing = Arc::new(OutgoingMessageSender::new(tx));
+        let outgoing = ThreadScopedOutgoingMessageSender::new(
+            outgoing,
+            vec![ConnectionId(1)],
+            ThreadId::new(),
+        );
+        let assessment = GuardianAssessmentEvent {
+            id: "cmd-approved".to_string(),
+            turn_id: "turn-approved".to_string(),
+            status: codex_protocol::protocol::GuardianAssessmentStatus::InProgress,
+            risk_score: None,
+            risk_level: None,
+            rationale: None,
+            action: Some(
+                serde_json::from_value(json!({
+                    "tool": "shell",
+                    "command": "rm -f /tmp/guardian-approved.sqlite",
+                    "cwd": "/tmp",
+                }))
+                .expect("guardian action"),
+            ),
+        };
+        let completion_item =
+            guardian_pending_command_execution_item(&assessment).expect("command-like action");
+        start_command_execution_item_once(
+            &conversation_id,
+            assessment.turn_id.clone(),
+            assessment.id.clone(),
+            completion_item.command.clone(),
+            completion_item.cwd.clone(),
+            completion_item.command_actions.clone(),
+            CommandExecutionSource::Agent,
+            &outgoing,
+            &thread_state,
+        )
+        .await;
+        let approved = GuardianAssessmentEvent {
+            id: assessment.id.clone(),
+            turn_id: assessment.turn_id.clone(),
+            status: codex_protocol::protocol::GuardianAssessmentStatus::Approved,
+            risk_score: Some(12),
+            risk_level: Some(codex_protocol::protocol::GuardianRiskLevel::Low),
+            rationale: Some("ok".to_string()),
+            action: assessment.action.clone(),
+        };
+        outgoing
+            .send_server_notification(guardian_auto_approval_review_notification(
+                &conversation_id,
+                &approved.turn_id,
+                &approved,
+            ))
+            .await;
+
+        let _ = recv_broadcast_message(&mut rx).await?;
+        let msg = recv_broadcast_message(&mut rx).await?;
+        match msg {
+            OutgoingMessage::AppServerNotification(
+                ServerNotification::ItemGuardianApprovalReviewCompleted(payload),
+            ) => {
+                assert_eq!(
+                    payload.review.status,
+                    GuardianApprovalReviewStatus::Approved
+                );
+            }
+            other => bail!("unexpected message: {other:?}"),
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "approved review should not complete the item"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn guardian_pending_command_execution_item_supports_execve_actions() {
+        let assessment = GuardianAssessmentEvent {
+            id: "cmd-execve".to_string(),
+            turn_id: "turn-execve".to_string(),
+            status: codex_protocol::protocol::GuardianAssessmentStatus::InProgress,
+            risk_score: None,
+            risk_level: None,
+            rationale: None,
+            action: Some(
+                serde_json::from_value(json!({
+                    "tool": "shell",
+                    "program": "/bin/rm",
+                    "argv": ["/usr/bin/rm", "-f", "/tmp/file.sqlite"],
+                    "cwd": "/tmp",
+                }))
+                .expect("guardian action"),
+            ),
+        };
+
+        assert_eq!(
+            guardian_pending_command_execution_item(&assessment),
+            Some(CommandExecutionCompletionItem {
+                command: "/bin/rm -f /tmp/file.sqlite".to_string(),
+                cwd: PathBuf::from("/tmp"),
+                command_actions: vec![V2ParsedCommand::Unknown {
+                    command: "/bin/rm -f /tmp/file.sqlite".to_string(),
+                }],
+            }),
+        );
     }
 
     #[test]
