@@ -1,10 +1,15 @@
 use std::path::PathBuf;
 
 use clap::Parser;
+use codex_core::auth::set_auth_failure_reporter;
 use codex_core::config::Config;
+use codex_feedback::AuthFailureEventQueueFlushGuard;
+use codex_feedback::auth_failure_event_queue_flush_timeout;
+use codex_feedback::enqueue_auth_failure_event_tags;
 use codex_git_utils::ApplyGitRequest;
 use codex_git_utils::apply_git_patch;
 use codex_utils_cli::CliConfigOverrides;
+use std::sync::Arc;
 
 use crate::chatgpt_token::init_chatgpt_token_from_auth;
 use crate::get_task::GetTaskResponse;
@@ -31,6 +36,12 @@ pub async fn run_apply_command(
             .map_err(anyhow::Error::msg)?,
     )
     .await?;
+    let _auth_failure_reporter_guard = config
+        .feedback_enabled
+        .then(|| set_auth_failure_reporter(Arc::new(enqueue_auth_failure_event_tags)));
+    let _auth_failure_flush_guard = config
+        .feedback_enabled
+        .then(|| AuthFailureEventQueueFlushGuard::new(auth_failure_event_queue_flush_timeout()));
 
     init_chatgpt_token_from_auth(&config.codex_home, config.cli_auth_credentials_store_mode)
         .await?;

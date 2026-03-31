@@ -10,6 +10,13 @@ pub use cli::Cli;
 use anyhow::anyhow;
 use chrono::Utc;
 use codex_cloud_tasks_client::TaskStatus;
+use codex_core::config::find_codex_home;
+use codex_core::config::load_feedback_enabled_with_cli_overrides;
+use codex_feedback::AuthFailureEventQueueFlushGuard;
+use codex_feedback::CodexFeedback;
+use codex_feedback::auth_failure_event_queue_flush_timeout;
+use codex_feedback::enqueue_auth_failure_event_tags;
+use codex_feedback::flush_auth_failure_event_queue_and_exit;
 use codex_git_utils::current_branch_name;
 use codex_git_utils::default_branch_name;
 use owo_colors::OwoColorize;
@@ -25,6 +32,7 @@ use supports_color::Stream as SupportStream;
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::prelude::*;
 use util::append_error_log;
 use util::format_relative_time;
 use util::set_user_agent_suffix;
@@ -76,7 +84,7 @@ async fn init_backend(user_agent_suffix: &str) -> anyhow::Result<BackendContext>
             eprintln!(
                 "Not signed in. Please run 'codex login' to sign in with ChatGPT, then re-run 'codex cloud'."
             );
-            std::process::exit(1);
+            flush_auth_failure_event_queue_and_exit(auth_failure_event_queue_flush_timeout(), 1);
         }
     };
 
@@ -90,7 +98,7 @@ async fn init_backend(user_agent_suffix: &str) -> anyhow::Result<BackendContext>
             eprintln!(
                 "Not signed in. Please run 'codex login' to sign in with ChatGPT, then re-run 'codex cloud'."
             );
-            std::process::exit(1);
+            flush_auth_failure_event_queue_and_exit(auth_failure_event_queue_flush_timeout(), 1);
         }
     };
 
@@ -504,7 +512,7 @@ async fn run_status_command(args: crate::cli::StatusCommand) -> anyhow::Result<(
         println!("{line}");
     }
     if !matches!(summary.status, TaskStatus::Ready) {
-        std::process::exit(1);
+        flush_auth_failure_event_queue_and_exit(auth_failure_event_queue_flush_timeout(), 1);
     }
     Ok(())
 }
@@ -601,7 +609,7 @@ async fn run_apply_command(args: crate::cli::ApplyCommand) -> anyhow::Result<()>
         outcome.status,
         codex_cloud_tasks_client::ApplyStatus::Success
     ) {
-        std::process::exit(1);
+        flush_auth_failure_event_queue_and_exit(auth_failure_event_queue_flush_timeout(), 1);
     }
     Ok(())
 }
@@ -732,6 +740,26 @@ fn spawn_apply(
 
 /// Entry point for the `codex cloud` subcommand.
 pub async fn run_main(cli: Cli, _codex_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()> {
+    let cli_kv_overrides = cli
+        .config_overrides
+        .parse_overrides()
+        .map_err(|e| anyhow!("error parsing -c overrides: {e}"))?;
+    let feedback_enabled = match find_codex_home() {
+        Ok(codex_home) => load_feedback_enabled_with_cli_overrides(
+            &codex_home,
+            std::env::current_dir().ok(),
+            &cli_kv_overrides,
+            codex_core::config_loader::LoaderOverrides::default(),
+        )
+        .await
+        .unwrap_or(false),
+        Err(_) => false,
+    };
+    let _auth_failure_reporter_guard = feedback_enabled.then(|| {
+        codex_core::auth::set_auth_failure_reporter(Arc::new(enqueue_auth_failure_event_tags))
+    });
+    let _auth_failure_flush_guard = feedback_enabled
+        .then(|| AuthFailureEventQueueFlushGuard::new(auth_failure_event_queue_flush_timeout()));
     if let Some(command) = cli.command {
         return match command {
             crate::cli::Command::Exec(args) => run_exec_command(args).await,
@@ -745,14 +773,20 @@ pub async fn run_main(cli: Cli, _codex_linux_sandbox_exe: Option<PathBuf>) -> an
 
     // Very minimal logging setup; mirrors other crates' pattern.
     let default_level = "error";
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .or_else(|_| EnvFilter::try_new(default_level))
-                .unwrap_or_else(|_| EnvFilter::new(default_level)),
+    let env_filter = EnvFilter::try_from_default_env()
+        .or_else(|_| EnvFilter::try_new(default_level))
+        .unwrap_or_else(|_| EnvFilter::new(default_level));
+    let feedback = CodexFeedback::new();
+    let feedback_auth_event_layer = feedback_enabled.then(|| feedback.auth_event_layer());
+    let _ = tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(std::io::stderr().is_terminal())
+                .with_writer(std::io::stderr)
+                .with_filter(env_filter)
+                .with_filter(codex_feedback::exclude_auth_failure_events()),
         )
-        .with_ansi(std::io::stderr().is_terminal())
-        .with_writer(std::io::stderr)
+        .with(feedback_auth_event_layer)
         .try_init();
 
     info!("Launching Cloud Tasks list UI");
@@ -2013,7 +2047,10 @@ pub async fn run_main(cli: Cli, _codex_linux_sandbox_exe: Option<PathBuf>) -> an
     let _ = crossterm::execute!(std::io::stdout(), LeaveAlternateScreen);
 
     if exit_code != 0 {
-        std::process::exit(exit_code);
+        flush_auth_failure_event_queue_and_exit(
+            auth_failure_event_queue_flush_timeout(),
+            exit_code,
+        );
     }
     Ok(())
 }

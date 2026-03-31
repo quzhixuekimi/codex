@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -206,37 +207,148 @@ pub(crate) fn emit_sentry_auth_failure_event_with_auth_env(
     tags: &FeedbackRequestTags<'_>,
     auth_env: &AuthEnvTelemetry,
 ) {
+    if auth_env.refresh_token_url_override_present {
+        return;
+    }
+
+    let snapshot = FeedbackRequestSnapshot::from_tags(tags);
+    let mut fields = BTreeMap::from([
+        ("report_kind".to_string(), "auth_failure_auto".to_string()),
+        ("endpoint".to_string(), tags.endpoint.to_string()),
+        (
+            "auth_header_attached".to_string(),
+            tags.auth_header_attached.to_string(),
+        ),
+        (
+            "auth_retry_after_unauthorized".to_string(),
+            tags.auth_retry_after_unauthorized
+                .unwrap_or(false)
+                .to_string(),
+        ),
+        (
+            "auth_env_openai_api_key_present".to_string(),
+            auth_env.openai_api_key_env_present.to_string(),
+        ),
+        (
+            "auth_env_codex_api_key_present".to_string(),
+            auth_env.codex_api_key_env_present.to_string(),
+        ),
+        (
+            "auth_env_codex_api_key_enabled".to_string(),
+            auth_env.codex_api_key_env_enabled.to_string(),
+        ),
+        (
+            "auth_env_refresh_token_url_override_present".to_string(),
+            auth_env.refresh_token_url_override_present.to_string(),
+        ),
+        (
+            "cli_version".to_string(),
+            env!("CARGO_PKG_VERSION").to_string(),
+        ),
+    ]);
+    if let Some(auth_header_name) = tags.auth_header_name {
+        fields.insert("auth_header_name".to_string(), auth_header_name.to_string());
+    }
+    if let Some(auth_mode) = tags.auth_mode {
+        fields.insert("auth_mode".to_string(), auth_mode.to_string());
+    }
+    if let Some(auth_recovery_mode) = tags.auth_recovery_mode {
+        fields.insert(
+            "auth_recovery_mode".to_string(),
+            auth_recovery_mode.to_string(),
+        );
+    }
+    if let Some(auth_recovery_phase) = tags.auth_recovery_phase {
+        fields.insert(
+            "auth_recovery_phase".to_string(),
+            auth_recovery_phase.to_string(),
+        );
+    }
+    if let Some(auth_connection_reused) = tags.auth_connection_reused {
+        fields.insert(
+            "auth_connection_reused".to_string(),
+            auth_connection_reused.to_string(),
+        );
+    }
+    if let Some(auth_request_id) = tags.auth_request_id {
+        fields.insert("auth_request_id".to_string(), auth_request_id.to_string());
+    }
+    if let Some(auth_cf_ray) = tags.auth_cf_ray {
+        fields.insert("auth_cf_ray".to_string(), auth_cf_ray.to_string());
+    }
+    if let Some(auth_error_code) = tags.auth_error_code {
+        fields.insert("auth_error_code".to_string(), auth_error_code.to_string());
+    }
+    if let Some(auth_recovery_followup_success) = tags.auth_recovery_followup_success {
+        fields.insert(
+            "auth_recovery_followup_success".to_string(),
+            auth_recovery_followup_success.to_string(),
+        );
+    }
+    if let Some(auth_recovery_followup_status) = tags.auth_recovery_followup_status {
+        fields.insert(
+            "auth_recovery_followup_status".to_string(),
+            auth_recovery_followup_status.to_string(),
+        );
+    }
+    if let Some(auth_env_provider_key_name) = auth_env.provider_env_key_name.as_deref() {
+        fields.insert(
+            "auth_env_provider_key_name".to_string(),
+            auth_env_provider_key_name.to_string(),
+        );
+    }
+    if let Some(auth_env_provider_key_present) = auth_env.provider_env_key_present {
+        fields.insert(
+            "auth_env_provider_key_present".to_string(),
+            auth_env_provider_key_present.to_string(),
+        );
+    }
+    if crate::auth::report_auth_failure(fields.clone()) {
+        return;
+    }
+
     tracing::event!(
         target: SENTRY_AUTH_FAILURES_TARGET,
         tracing::Level::ERROR,
-        report_kind = "auth_failure_auto",
-        endpoint = tags.endpoint,
-        auth_header_attached = tags.auth_header_attached,
-        auth_header_name = tags.auth_header_name.unwrap_or(""),
-        auth_mode = tags.auth_mode.unwrap_or(""),
-        auth_retry_after_unauthorized = tags
-            .auth_retry_after_unauthorized
-            .unwrap_or(false),
-        auth_recovery_mode = tags.auth_recovery_mode.unwrap_or(""),
-        auth_recovery_phase = tags.auth_recovery_phase.unwrap_or(""),
-        auth_connection_reused = tags.auth_connection_reused.unwrap_or(false),
-        auth_request_id = tags.auth_request_id.unwrap_or(""),
-        auth_cf_ray = tags.auth_cf_ray.unwrap_or(""),
-        auth_error = tags.auth_error.unwrap_or(""),
-        auth_error_code = tags.auth_error_code.unwrap_or(""),
-        auth_recovery_followup_success = tags
-            .auth_recovery_followup_success
-            .unwrap_or(false),
-        auth_recovery_followup_status = tags
-            .auth_recovery_followup_status
-            .unwrap_or_default(),
-        auth_env_openai_api_key_present = auth_env.openai_api_key_env_present,
-        auth_env_codex_api_key_present = auth_env.codex_api_key_env_present,
-        auth_env_codex_api_key_enabled = auth_env.codex_api_key_env_enabled,
-        auth_env_provider_key_name = auth_env.provider_env_key_name.as_deref().unwrap_or(""),
-        auth_env_provider_key_present = auth_env.provider_env_key_present.unwrap_or(false),
-        auth_env_refresh_token_url_override_present = auth_env.refresh_token_url_override_present,
-        cli_version = env!("CARGO_PKG_VERSION"),
+        report_kind = fields.get("report_kind").map(String::as_str).unwrap_or(""),
+        endpoint = fields.get("endpoint").map(String::as_str).unwrap_or(""),
+        auth_header_attached = fields
+            .get("auth_header_attached")
+            .is_some_and(|value| value == "true"),
+        auth_header_name = fields.get("auth_header_name").map(String::as_str).unwrap_or(""),
+        auth_mode = fields.get("auth_mode").map(String::as_str).unwrap_or(""),
+        auth_retry_after_unauthorized = fields
+            .get("auth_retry_after_unauthorized")
+            .is_some_and(|value| value == "true"),
+        auth_recovery_mode = fields.get("auth_recovery_mode").map(String::as_str).unwrap_or(""),
+        auth_recovery_phase = fields.get("auth_recovery_phase").map(String::as_str).unwrap_or(""),
+        auth_connection_reused = snapshot.auth_connection_reused,
+        auth_request_id = fields.get("auth_request_id").map(String::as_str).unwrap_or(""),
+        auth_cf_ray = fields.get("auth_cf_ray").map(String::as_str).unwrap_or(""),
+        auth_error = "",
+        auth_error_code = fields.get("auth_error_code").map(String::as_str).unwrap_or(""),
+        auth_recovery_followup_success = snapshot.auth_recovery_followup_success,
+        auth_recovery_followup_status = snapshot.auth_recovery_followup_status,
+        auth_env_openai_api_key_present = fields
+            .get("auth_env_openai_api_key_present")
+            .is_some_and(|value| value == "true"),
+        auth_env_codex_api_key_present = fields
+            .get("auth_env_codex_api_key_present")
+            .is_some_and(|value| value == "true"),
+        auth_env_codex_api_key_enabled = fields
+            .get("auth_env_codex_api_key_enabled")
+            .is_some_and(|value| value == "true"),
+        auth_env_provider_key_name = fields
+            .get("auth_env_provider_key_name")
+            .map(String::as_str)
+            .unwrap_or(""),
+        auth_env_provider_key_present = auth_env
+            .provider_env_key_present
+            .map_or_else(String::new, |value| value.to_string()),
+        auth_env_refresh_token_url_override_present = fields
+            .get("auth_env_refresh_token_url_override_present")
+            .is_some_and(|value| value == "true"),
+        cli_version = fields.get("cli_version").map(String::as_str).unwrap_or(""),
     );
 }
 

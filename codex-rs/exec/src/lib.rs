@@ -57,6 +57,7 @@ use codex_core::check_execpolicy_for_warnings;
 use codex_core::config::Config;
 use codex_core::config::ConfigBuilder;
 use codex_core::config::ConfigOverrides;
+use codex_core::config::feedback_enabled_from_config_toml;
 use codex_core::config::find_codex_home;
 use codex_core::config::load_config_as_toml_with_cli_overrides;
 use codex_core::config::resolve_oss_provider;
@@ -65,8 +66,11 @@ use codex_core::config_loader::LoaderOverrides;
 use codex_core::config_loader::format_config_error_with_source;
 use codex_core::format_exec_policy_error_with_source;
 use codex_core::path_utils;
+use codex_feedback::AuthFailureEventQueueFlushGuard;
 use codex_feedback::CodexFeedback;
-use codex_feedback::upload_auth_failure_event_tags;
+use codex_feedback::auth_failure_event_queue_flush_timeout;
+use codex_feedback::enqueue_auth_failure_event_tags;
+use codex_feedback::flush_auth_failure_event_queue_and_exit;
 use codex_git_utils::get_git_repo_root;
 use codex_otel::set_parent_from_context;
 use codex_otel::traceparent_context_from_env;
@@ -222,7 +226,8 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
     let fmt_layer = tracing_subscriber::fmt::layer()
         .with_ansi(stderr_with_ansi)
         .with_writer(std::io::stderr)
-        .with_filter(env_filter);
+        .with_filter(env_filter)
+        .with_filter(codex_feedback::exclude_auth_failure_events());
 
     let sandbox_mode = if full_auto {
         Some(SandboxMode::WorkspaceWrite)
@@ -238,7 +243,7 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         #[allow(clippy::print_stderr)]
         Err(e) => {
             eprintln!("Error parsing -c overrides: {e}");
-            std::process::exit(1);
+            flush_auth_failure_event_queue_and_exit(auth_failure_event_queue_flush_timeout(), 1);
         }
     };
 
@@ -254,17 +259,11 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         Ok(codex_home) => codex_home,
         Err(err) => {
             eprintln!("Error finding codex home: {err}");
-            std::process::exit(1);
+            flush_auth_failure_event_queue_and_exit(auth_failure_event_queue_flush_timeout(), 1);
         }
     };
 
     let feedback = CodexFeedback::new();
-    let _auth_failure_reporter_guard =
-        codex_core::auth::set_auth_failure_reporter(Arc::new(|tags| {
-            if let Err(err) = upload_auth_failure_event_tags(tags) {
-                tracing::warn!(error = %err, "failed to upload auth failure event");
-            }
-        }));
 
     #[allow(clippy::print_stderr)]
     let config_toml = match load_config_as_toml_with_cli_overrides(
@@ -288,7 +287,7 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
             } else {
                 eprintln!("Error loading config.toml: {err}");
             }
-            std::process::exit(1);
+            flush_auth_failure_event_queue_and_exit(auth_failure_event_queue_flush_timeout(), 1);
         }
     };
 
@@ -296,6 +295,7 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         .chatgpt_base_url
         .clone()
         .unwrap_or_else(|| "https://chatgpt.com/backend-api/".to_string());
+    let feedback_enabled = feedback_enabled_from_config_toml(&config_toml);
     // TODO(gt): Make cloud requirements failures blocking once we can fail-closed.
     let cloud_requirements = cloud_requirements_loader_for_storage(
         codex_home.clone(),
@@ -372,6 +372,11 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         .cloud_requirements(cloud_requirements)
         .build()
         .await?;
+    let _auth_failure_reporter_guard = feedback_enabled.then(|| {
+        codex_core::auth::set_auth_failure_reporter(Arc::new(enqueue_auth_failure_event_tags))
+    });
+    let _auth_failure_flush_guard = feedback_enabled
+        .then(|| AuthFailureEventQueueFlushGuard::new(auth_failure_event_queue_flush_timeout()));
 
     #[allow(clippy::print_stderr)]
     match check_execpolicy_for_warnings(&config.config_layer_stack).await {
@@ -381,7 +386,7 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
                 "Error loading rules:\n{}",
                 format_exec_policy_error_with_source(&err)
             );
-            std::process::exit(1);
+            flush_auth_failure_event_queue_and_exit(auth_failure_event_queue_flush_timeout(), 1);
         }
     }
 
@@ -394,7 +399,7 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         forced_chatgpt_workspace_id: config.forced_chatgpt_workspace_id.clone(),
     }) {
         eprintln!("{err}");
-        std::process::exit(1);
+        flush_auth_failure_event_queue_and_exit(auth_failure_event_queue_flush_timeout(), 1);
     }
 
     let otel = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -416,13 +421,19 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         }
     };
 
-    let otel_logger_layer = otel.as_ref().and_then(|o| o.logger_layer());
+    let otel_logger_layer = otel
+        .as_ref()
+        .and_then(|o| o.logger_layer())
+        .map(|layer| layer.with_filter(codex_feedback::exclude_auth_failure_events()));
 
-    let otel_tracing_layer = otel.as_ref().and_then(|o| o.tracing_layer());
+    let otel_tracing_layer = otel
+        .as_ref()
+        .and_then(|o| o.tracing_layer())
+        .map(|layer| layer.with_filter(codex_feedback::exclude_auth_failure_events()));
 
-    let feedback_layer = feedback.logger_layer();
-    let feedback_metadata_layer = feedback.metadata_layer();
-    let feedback_auth_event_layer = feedback.auth_event_layer();
+    let feedback_layer = feedback_enabled.then(|| feedback.logger_layer());
+    let feedback_metadata_layer = feedback_enabled.then(|| feedback.metadata_layer());
+    let feedback_auth_event_layer = feedback_enabled.then(|| feedback.auth_event_layer());
 
     let _ = tracing_subscriber::registry()
         .with(fmt_layer)
@@ -463,7 +474,7 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         opt_out_notification_methods: Vec::new(),
         channel_capacity: DEFAULT_IN_PROCESS_CHANNEL_CAPACITY,
     };
-    run_exec_session(ExecRunArgs {
+    let result = run_exec_session(ExecRunArgs {
         in_process_start_args,
         command,
         config,
@@ -480,7 +491,8 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         stderr_with_ansi,
     })
     .instrument(exec_span)
-    .await
+    .await;
+    result
 }
 
 async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
@@ -538,7 +550,7 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
         && get_git_repo_root(&default_cwd).is_none()
     {
         eprintln!("Not inside a trusted directory and --skip-git-repo-check was not specified.");
-        std::process::exit(1);
+        flush_auth_failure_event_queue_and_exit(auth_failure_event_queue_flush_timeout(), 1);
     }
 
     let mut request_ids = RequestIdSequencer::new();
@@ -842,7 +854,7 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
     }
     event_processor.print_final_output();
     if error_seen {
-        std::process::exit(1);
+        flush_auth_failure_event_queue_and_exit(auth_failure_event_queue_flush_timeout(), 1);
     }
 
     Ok(())
@@ -1468,7 +1480,7 @@ fn load_output_schema(path: Option<PathBuf>) -> Option<Value> {
                 "Failed to read output schema file {}: {err}",
                 path.display()
             );
-            std::process::exit(1);
+            flush_auth_failure_event_queue_and_exit(auth_failure_event_queue_flush_timeout(), 1);
         }
     };
 
@@ -1479,7 +1491,7 @@ fn load_output_schema(path: Option<PathBuf>) -> Option<Value> {
                 "Output schema file {} is not valid JSON: {err}",
                 path.display()
             );
-            std::process::exit(1);
+            flush_auth_failure_event_queue_and_exit(auth_failure_event_queue_flush_timeout(), 1);
         }
     }
 }
@@ -1565,7 +1577,7 @@ fn read_prompt_from_stdin(behavior: StdinPromptBehavior) -> Option<String> {
             eprintln!(
                 "No prompt provided. Either specify one as an argument or pipe the prompt into stdin."
             );
-            std::process::exit(1);
+            flush_auth_failure_event_queue_and_exit(auth_failure_event_queue_flush_timeout(), 1);
         }
         StdinPromptBehavior::RequiredIfPiped => {
             eprintln!("Reading prompt from stdin...");
@@ -1580,14 +1592,14 @@ fn read_prompt_from_stdin(behavior: StdinPromptBehavior) -> Option<String> {
     let mut bytes = Vec::new();
     if let Err(e) = std::io::stdin().read_to_end(&mut bytes) {
         eprintln!("Failed to read prompt from stdin: {e}");
-        std::process::exit(1);
+        flush_auth_failure_event_queue_and_exit(auth_failure_event_queue_flush_timeout(), 1);
     }
 
     let buffer = match decode_prompt_bytes(&bytes) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("Failed to read prompt from stdin: {e}");
-            std::process::exit(1);
+            flush_auth_failure_event_queue_and_exit(auth_failure_event_queue_flush_timeout(), 1);
         }
     };
 
@@ -1596,7 +1608,10 @@ fn read_prompt_from_stdin(behavior: StdinPromptBehavior) -> Option<String> {
             StdinPromptBehavior::OptionalAppend => None,
             StdinPromptBehavior::RequiredIfPiped | StdinPromptBehavior::Forced => {
                 eprintln!("No prompt provided via stdin.");
-                std::process::exit(1);
+                flush_auth_failure_event_queue_and_exit(
+                    auth_failure_event_queue_flush_timeout(),
+                    1,
+                );
             }
         }
     } else {

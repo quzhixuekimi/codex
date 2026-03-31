@@ -156,3 +156,51 @@ args = ["--format=text"]
         })
     );
 }
+
+#[test]
+fn openai_provider_without_base_url_emits_sentry_auth_failures() {
+    let provider = ModelProviderInfo::create_openai_provider(/*base_url*/ None);
+
+    assert!(provider.should_emit_sentry_auth_failures());
+}
+
+#[test]
+fn openai_provider_with_non_openai_base_url_skips_sentry_auth_failures() {
+    let provider =
+        ModelProviderInfo::create_openai_provider(Some("https://example.com/v1".to_string()));
+
+    assert!(!provider.should_emit_sentry_auth_failures());
+}
+
+#[test]
+fn openai_provider_with_openai_subdomain_base_url_emits_sentry_auth_failures() {
+    let provider = ModelProviderInfo::create_openai_provider(Some(
+        "https://api-staging.openai.com/v1".to_string(),
+    ));
+
+    assert!(provider.should_emit_sentry_auth_failures());
+}
+
+#[test]
+fn openai_provider_with_chatgpt_subdomain_base_url_emits_sentry_auth_failures() {
+    let provider =
+        ModelProviderInfo::create_openai_provider(Some("https://ab.chatgpt.com/v1".to_string()));
+
+    assert!(provider.should_emit_sentry_auth_failures());
+}
+
+#[test]
+fn renamed_openai_provider_still_emits_sentry_auth_failures() {
+    let mut provider = ModelProviderInfo::create_openai_provider(/*base_url*/ None);
+    provider.name = "Staging".to_string();
+
+    assert!(provider.should_emit_sentry_auth_failures());
+}
+
+#[test]
+fn oss_provider_skips_sentry_auth_failures() {
+    let provider =
+        create_oss_provider_with_base_url("https://api.openai.com/v1", WireApi::Responses);
+
+    assert!(!provider.should_emit_sentry_auth_failures());
+}

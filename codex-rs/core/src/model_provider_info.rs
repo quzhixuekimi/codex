@@ -19,6 +19,7 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::fmt;
 use std::time::Duration;
+use url::Url;
 
 const DEFAULT_STREAM_IDLE_TIMEOUT_MS: u64 = 300_000;
 const DEFAULT_STREAM_MAX_RETRIES: u64 = 5;
@@ -315,6 +316,29 @@ impl ModelProviderInfo {
 
     pub(crate) fn has_command_auth(&self) -> bool {
         self.auth.is_some()
+    }
+
+    pub(crate) fn should_emit_sentry_auth_failures(&self) -> bool {
+        self.requires_openai_auth
+            && self
+                .base_url
+                .as_deref()
+                .map(Self::is_openai_owned_base_url)
+                .unwrap_or(true)
+    }
+
+    fn is_openai_owned_base_url(base_url: &str) -> bool {
+        let Ok(parsed) = Url::parse(base_url) else {
+            return false;
+        };
+        let Some(host) = parsed.host_str() else {
+            return false;
+        };
+
+        host == "openai.com"
+            || host.ends_with(".openai.com")
+            || host == "chatgpt.com"
+            || host.ends_with(".chatgpt.com")
     }
 }
 

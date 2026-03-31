@@ -840,7 +840,7 @@ fn models_request_telemetry_emits_auth_env_feedback_tags_on_failure() {
 }
 
 #[test]
-fn models_request_telemetry_emits_sentry_auth_failure_event_on_401() {
+fn models_request_telemetry_does_not_emit_sentry_auth_failure_event_on_401() {
     let tags = Arc::new(Mutex::new(BTreeMap::new()));
     let _guard = tracing_subscriber::registry()
         .with(TagCollectorLayer {
@@ -888,28 +888,7 @@ fn models_request_telemetry_emits_sentry_auth_failure_event_on_401() {
         Duration::from_millis(17),
     );
 
-    let tags = tags.lock().unwrap().clone();
-    assert_eq!(
-        tags.get("report_kind").map(String::as_str),
-        Some("auth_failure_auto")
-    );
-    assert_eq!(tags.get("endpoint").map(String::as_str), Some("/models"));
-    assert_eq!(
-        tags.get("auth_header_attached").map(String::as_str),
-        Some("true")
-    );
-    assert_eq!(
-        tags.get("auth_header_name").map(String::as_str),
-        Some("authorization")
-    );
-    assert_eq!(
-        tags.get("auth_request_id").map(String::as_str),
-        Some("req-models-401")
-    );
-    assert_eq!(
-        tags.get("auth_cf_ray").map(String::as_str),
-        Some("ray-models-401")
-    );
+    assert!(tags.lock().unwrap().is_empty());
 }
 
 #[test]

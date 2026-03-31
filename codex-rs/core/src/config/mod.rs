@@ -761,6 +761,31 @@ pub async fn load_config_as_toml_with_cli_overrides(
     Ok(cfg)
 }
 
+pub async fn load_feedback_enabled_with_cli_overrides(
+    codex_home: &Path,
+    cwd: Option<PathBuf>,
+    cli_overrides: &[(String, TomlValue)],
+    loader_overrides: LoaderOverrides,
+) -> std::io::Result<bool> {
+    let cwd = cwd.map(AbsolutePathBuf::from_absolute_path).transpose()?;
+    let config_layer_stack = load_config_layers_state(
+        codex_home,
+        cwd,
+        cli_overrides,
+        loader_overrides,
+        CloudRequirementsLoader::default(),
+    )
+    .await?;
+
+    let merged_toml = config_layer_stack.effective_config();
+    let cfg = deserialize_config_toml_with_base(merged_toml, codex_home).map_err(|e| {
+        tracing::error!("Failed to deserialize overridden config: {e}");
+        e
+    })?;
+
+    Ok(feedback_enabled_from_config_toml(&cfg))
+}
+
 pub(crate) fn deserialize_config_toml_with_base(
     root_value: TomlValue,
     config_base_dir: &Path,
@@ -794,6 +819,13 @@ fn load_catalog_json(path: &AbsolutePathBuf) -> std::io::Result<ModelsResponse> 
         ));
     }
     Ok(catalog)
+}
+
+pub fn feedback_enabled_from_config_toml(cfg: &ConfigToml) -> bool {
+    cfg.feedback
+        .as_ref()
+        .and_then(|feedback| feedback.enabled)
+        .unwrap_or(true)
 }
 
 fn load_model_catalog(
@@ -1983,6 +2015,7 @@ impl Config {
     ) -> std::io::Result<Self> {
         validate_model_providers(&cfg.model_providers)
             .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidInput, message))?;
+        let feedback_enabled = feedback_enabled_from_config_toml(&cfg);
         // Ensure that every field of ConfigRequirements is applied to the final
         // Config.
         let ConfigRequirements {
@@ -2685,11 +2718,7 @@ impl Config {
                 .as_ref()
                 .and_then(|a| a.enabled)
                 .or(cfg.analytics.as_ref().and_then(|a| a.enabled)),
-            feedback_enabled: cfg
-                .feedback
-                .as_ref()
-                .and_then(|feedback| feedback.enabled)
-                .unwrap_or(true),
+            feedback_enabled,
             tool_suggest,
             tui_notifications: cfg
                 .tui

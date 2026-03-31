@@ -14,10 +14,11 @@ use reqwest::header::HeaderMap;
 use reqwest::header::HeaderValue;
 use serde::Serialize;
 use serde_json::json;
+use serial_test::serial;
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use tempfile::TempDir;
 use std::sync::Mutex;
+use tempfile::TempDir;
 use tempfile::tempdir;
 use wiremock::Mock;
 use wiremock::MockServer;
@@ -813,15 +814,10 @@ fn refresh_token_reused_builds_sentry_auth_failure_fields() {
         BTreeMap::from([
             ("report_kind".to_string(), "auth_failure_auto".to_string()),
             ("endpoint".to_string(), "/oauth/token".to_string()),
-            ("auth_header_attached".to_string(), "true".to_string()),
-            ("auth_header_name".to_string(), "authorization".to_string()),
+            ("auth_header_attached".to_string(), "false".to_string()),
             ("auth_mode".to_string(), "Chatgpt".to_string()),
             ("auth_request_id".to_string(), "req_refresh_123".to_string()),
             ("auth_cf_ray".to_string(), "abc123-SJC".to_string()),
-            (
-                "auth_error".to_string(),
-                "refresh token already used".to_string()
-            ),
             (
                 "auth_error_code".to_string(),
                 "refresh_token_reused".to_string()
@@ -836,7 +832,7 @@ fn refresh_token_reused_builds_sentry_auth_failure_fields() {
 
 #[tokio::test]
 #[serial(codex_api_key)]
-async fn refresh_token_reused_reports_fields_through_auth_failure_reporter() {
+async fn refresh_token_reused_with_refresh_url_override_skips_auth_failure_reporter() {
     let codex_home = tempdir().unwrap();
     write_auth_file(
         AuthFileParams {
@@ -877,6 +873,7 @@ async fn refresh_token_reused_reports_fields_through_auth_failure_reporter() {
                 .lock()
                 .expect("report collector poisoned")
                 .push(fields);
+            true
         })
     });
 
@@ -896,29 +893,65 @@ async fn refresh_token_reused_reports_fields_through_auth_failure_reporter() {
     );
 
     let reported = reported.lock().expect("report collector poisoned");
-    assert_eq!(reported.len(), 1);
+    assert!(reported.is_empty());
+}
+
+#[test]
+fn nested_auth_failure_reporter_guard_restores_previous_reporter() {
+    let outer_reported = Arc::new(Mutex::new(Vec::new()));
+    let inner_reported = Arc::new(Mutex::new(Vec::new()));
+    let outer_guard = set_auth_failure_reporter({
+        let outer_reported = Arc::clone(&outer_reported);
+        Arc::new(move |fields| {
+            outer_reported
+                .lock()
+                .expect("outer collector poisoned")
+                .push(fields);
+            true
+        })
+    });
+
+    {
+        let _inner_guard = set_auth_failure_reporter({
+            let inner_reported = Arc::clone(&inner_reported);
+            Arc::new(move |fields| {
+                inner_reported
+                    .lock()
+                    .expect("inner collector poisoned")
+                    .push(fields);
+                true
+            })
+        });
+        assert!(report_auth_failure(BTreeMap::from([(
+            "endpoint".to_string(),
+            "/responses".to_string(),
+        )])));
+    }
+
+    assert!(report_auth_failure(BTreeMap::from([(
+        "endpoint".to_string(),
+        "/models".to_string(),
+    )])));
+    drop(outer_guard);
+
     assert_eq!(
-        reported[0],
-        BTreeMap::from([
-            ("report_kind".to_string(), "auth_failure_auto".to_string()),
-            ("endpoint".to_string(), "/oauth/token".to_string()),
-            ("auth_header_attached".to_string(), "true".to_string()),
-            ("auth_header_name".to_string(), "authorization".to_string()),
-            ("auth_mode".to_string(), "Chatgpt".to_string()),
-            ("auth_request_id".to_string(), "req_refresh_123".to_string()),
-            ("auth_cf_ray".to_string(), "abc123-SJC".to_string()),
-            (
-                "auth_error".to_string(),
-                "refresh token already used".to_string()
-            ),
-            (
-                "auth_error_code".to_string(),
-                "refresh_token_reused".to_string()
-            ),
-            (
-                "cli_version".to_string(),
-                env!("CARGO_PKG_VERSION").to_string()
-            ),
-        ])
+        inner_reported
+            .lock()
+            .expect("inner collector poisoned")
+            .clone(),
+        vec![BTreeMap::from([(
+            "endpoint".to_string(),
+            "/responses".to_string(),
+        )])]
+    );
+    assert_eq!(
+        outer_reported
+            .lock()
+            .expect("outer collector poisoned")
+            .clone(),
+        vec![BTreeMap::from([(
+            "endpoint".to_string(),
+            "/models".to_string(),
+        )])]
     );
 }

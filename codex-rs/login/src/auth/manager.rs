@@ -6,7 +6,7 @@ use reqwest::header::HeaderMap;
 use serde::Deserialize;
 use serde::Serialize;
 #[cfg(test)]
-use serial_test::serial;
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::env;
 use std::fmt::Debug;
@@ -87,9 +87,15 @@ const REFRESH_TOKEN_ACCOUNT_MISMATCH_MESSAGE: &str = "Your access token could no
 const REFRESH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 pub const REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR: &str = "CODEX_REFRESH_TOKEN_URL_OVERRIDE";
 const SENTRY_AUTH_FAILURES_TARGET: &str = "sentry_auth_failures";
-static AUTH_FAILURE_REPORTER: Lazy<
-    RwLock<Option<Arc<dyn Fn(BTreeMap<String, String>) + Send + Sync + 'static>>>,
-> = Lazy::new(|| RwLock::new(None));
+type AuthFailureReporter = Arc<dyn Fn(BTreeMap<String, String>) -> bool + Send + Sync + 'static>;
+static AUTH_FAILURE_REPORTER: Lazy<RwLock<Option<AuthFailureReporter>>> =
+    Lazy::new(|| RwLock::new(None));
+#[cfg(test)]
+static AUTH_FAILURE_REPORTER_TEST_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+#[cfg(test)]
+thread_local! {
+    static AUTH_FAILURE_REPORTER_TEST_DEPTH: Cell<u32> = const { Cell::new(0) };
+}
 
 #[derive(Debug, Error)]
 pub enum RefreshTokenError {
@@ -99,23 +105,58 @@ pub enum RefreshTokenError {
     Transient(#[from] std::io::Error),
 }
 
-pub struct AuthFailureReporterGuard;
+pub struct AuthFailureReporterGuard {
+    previous: Option<AuthFailureReporter>,
+    #[cfg(test)]
+    _test_lock: Option<std::sync::MutexGuard<'static, ()>>,
+}
 
 impl Drop for AuthFailureReporterGuard {
     fn drop(&mut self) {
         if let Ok(mut reporter) = AUTH_FAILURE_REPORTER.write() {
-            *reporter = None;
+            *reporter = self.previous.take();
         }
+        #[cfg(test)]
+        AUTH_FAILURE_REPORTER_TEST_DEPTH.with(|depth| {
+            depth.set(depth.get().saturating_sub(1));
+        });
     }
 }
 
-pub fn set_auth_failure_reporter(
-    reporter: Arc<dyn Fn(BTreeMap<String, String>) + Send + Sync + 'static>,
-) -> AuthFailureReporterGuard {
+pub fn set_auth_failure_reporter(reporter: AuthFailureReporter) -> AuthFailureReporterGuard {
+    #[cfg(test)]
+    let test_lock = AUTH_FAILURE_REPORTER_TEST_DEPTH.with(|depth| {
+        if depth.get() == 0 {
+            depth.set(1);
+            Some(
+                AUTH_FAILURE_REPORTER_TEST_LOCK
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            )
+        } else {
+            depth.set(depth.get() + 1);
+            None
+        }
+    });
+    let mut previous = None;
     if let Ok(mut current) = AUTH_FAILURE_REPORTER.write() {
-        *current = Some(reporter);
+        previous = current.replace(reporter);
     }
-    AuthFailureReporterGuard
+    AuthFailureReporterGuard {
+        previous,
+        #[cfg(test)]
+        _test_lock: test_lock,
+    }
+}
+
+pub fn report_auth_failure(fields: BTreeMap<String, String>) -> bool {
+    if let Ok(reporter) = AUTH_FAILURE_REPORTER.read()
+        && let Some(reporter) = reporter.as_ref()
+    {
+        reporter(fields)
+    } else {
+        false
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -711,7 +752,9 @@ async fn request_chatgpt_token_refresh(
         let body = response.text().await.unwrap_or_default();
         tracing::error!("Failed to refresh token: {status}: {body}");
         if status == StatusCode::UNAUTHORIZED {
-            emit_sentry_auth_failure_event_for_refresh_failure(&headers, &body);
+            if !refresh_token_endpoint_override_present() {
+                emit_sentry_auth_failure_event_for_refresh_failure(&headers, &body);
+            }
             let failed = classify_refresh_token_failure(&body);
             Err(RefreshTokenError::Permanent(failed))
         } else {
@@ -725,10 +768,7 @@ async fn request_chatgpt_token_refresh(
 
 fn emit_sentry_auth_failure_event_for_refresh_failure(headers: &HeaderMap, body: &str) {
     let fields = refresh_failure_sentry_auth_fields(headers, body);
-    if let Ok(reporter) = AUTH_FAILURE_REPORTER.read()
-        && let Some(reporter) = reporter.as_ref()
-    {
-        reporter(fields);
+    if report_auth_failure(fields.clone()) {
         return;
     }
 
@@ -760,17 +800,14 @@ fn refresh_failure_sentry_auth_fields(headers: &HeaderMap, body: &str) -> BTreeM
         .and_then(|value| value.to_str().ok())
         .unwrap_or("");
     let auth_error_code = extract_refresh_token_error_code(body).unwrap_or_default();
-    let auth_error = try_parse_error_message(body);
 
     BTreeMap::from([
         ("report_kind".to_string(), "auth_failure_auto".to_string()),
         ("endpoint".to_string(), "/oauth/token".to_string()),
-        ("auth_header_attached".to_string(), "true".to_string()),
-        ("auth_header_name".to_string(), "authorization".to_string()),
+        ("auth_header_attached".to_string(), "false".to_string()),
         ("auth_mode".to_string(), "Chatgpt".to_string()),
         ("auth_request_id".to_string(), auth_request_id.to_string()),
         ("auth_cf_ray".to_string(), auth_cf_ray.to_string()),
-        ("auth_error".to_string(), auth_error),
         ("auth_error_code".to_string(), auth_error_code),
         (
             "cli_version".to_string(),
@@ -854,6 +891,10 @@ pub const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 fn refresh_token_endpoint() -> String {
     std::env::var(REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR)
         .unwrap_or_else(|_| REFRESH_TOKEN_URL.to_string())
+}
+
+fn refresh_token_endpoint_override_present() -> bool {
+    std::env::var_os(REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR).is_some()
 }
 
 impl AuthDotJson {

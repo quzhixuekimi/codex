@@ -8,6 +8,9 @@ use std::sync::Arc;
 use codex_arg0::Arg0DispatchPaths;
 use codex_core::config::Config;
 use codex_exec_server::EnvironmentManager;
+use codex_feedback::AuthFailureEventQueueFlushGuard;
+use codex_feedback::CodexFeedback;
+use codex_feedback::enqueue_auth_failure_event_tags;
 use codex_utils_cli::CliConfigOverrides;
 
 use rmcp::model::ClientNotification;
@@ -71,6 +74,15 @@ pub async fn run_main(
         .map_err(|e| {
             std::io::Error::new(ErrorKind::InvalidData, format!("error loading config: {e}"))
         })?;
+    let feedback_enabled = config.feedback_enabled;
+    let _auth_failure_reporter_guard = feedback_enabled.then(|| {
+        codex_core::auth::set_auth_failure_reporter(Arc::new(enqueue_auth_failure_event_tags))
+    });
+    let _auth_failure_flush_guard = feedback_enabled.then(|| {
+        AuthFailureEventQueueFlushGuard::new(
+            codex_feedback::auth_failure_event_queue_flush_timeout(),
+        )
+    });
 
     let otel = codex_core::otel_init::build_provider(
         &config,
@@ -87,12 +99,22 @@ pub async fn run_main(
 
     let fmt_layer = tracing_subscriber::fmt::layer()
         .with_writer(std::io::stderr)
-        .with_filter(EnvFilter::from_default_env());
-    let otel_logger_layer = otel.as_ref().and_then(|provider| provider.logger_layer());
-    let otel_tracing_layer = otel.as_ref().and_then(|provider| provider.tracing_layer());
+        .with_filter(EnvFilter::from_default_env())
+        .with_filter(codex_feedback::exclude_auth_failure_events());
+    let otel_logger_layer = otel
+        .as_ref()
+        .and_then(|provider| provider.logger_layer())
+        .map(|layer| layer.with_filter(codex_feedback::exclude_auth_failure_events()));
+    let otel_tracing_layer = otel
+        .as_ref()
+        .and_then(|provider| provider.tracing_layer())
+        .map(|layer| layer.with_filter(codex_feedback::exclude_auth_failure_events()));
+    let feedback = CodexFeedback::new();
+    let feedback_auth_event_layer = feedback_enabled.then(|| feedback.auth_event_layer());
 
     let _ = tracing_subscriber::registry()
         .with(fmt_layer)
+        .with(feedback_auth_event_layer)
         .with(otel_logger_layer)
         .with(otel_tracing_layer)
         .try_init();
