@@ -1599,7 +1599,7 @@ fn test_build_specs_without_attached_executor_omits_env_bound_tools() {
         sandbox_policy: &SandboxPolicy::DangerFullAccess,
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
     })
-    .with_attached_executor(false);
+    .with_attached_executor(/*has_attached_executor*/ false);
     let (tools, _) = build_specs(
         &tools_config,
         /*mcp_tools*/ None,

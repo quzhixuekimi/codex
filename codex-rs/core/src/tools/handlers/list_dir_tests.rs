@@ -73,7 +73,8 @@ async fn lists_directory_entries() {
 #[tokio::test]
 async fn list_dir_rejects_without_attached_executor() {
     let (session, mut turn) = make_session_and_context().await;
-    turn.environment = Arc::new(Environment::default().with_attached_executor(false));
+    turn.environment =
+        Arc::new(Environment::default().with_attached_executor(/*has_attached_executor*/ false));
     let handler = ListDirHandler;
 
     let err = match handler

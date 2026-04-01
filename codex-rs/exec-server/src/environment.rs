@@ -91,12 +91,9 @@ impl Environment {
     pub async fn create(exec_server_url: Option<String>) -> Result<Self, ExecServerError> {
         let exec_server_url = normalize_exec_server_url(exec_server_url);
         let has_attached_executor = !matches!(exec_server_url.as_deref(), Some("none"));
-        let exec_server_url = if has_attached_executor {
-            exec_server_url
-        } else {
-            None
-        };
-        let remote_exec_server_client = if let Some(url) = &exec_server_url {
+        let remote_exec_server_client = if let Some(url) = &exec_server_url
+            && has_attached_executor
+        {
             Some(
                 ExecServerClient::connect_websocket(RemoteExecServerConnectArgs {
                     websocket_url: url.clone(),
@@ -203,7 +200,7 @@ mod tests {
             .await
             .expect("create environment");
 
-        assert_eq!(environment.exec_server_url(), None);
+        assert_eq!(environment.exec_server_url(), Some("none"));
         assert!(!environment.has_attached_executor());
         assert!(environment.remote_exec_server_client.is_none());
     }

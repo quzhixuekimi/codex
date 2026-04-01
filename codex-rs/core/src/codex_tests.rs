@@ -2786,8 +2786,10 @@ async fn notify_request_permissions_response_ignores_unmatched_call_id() {
 #[tokio::test]
 async fn with_model_rebuilds_tools_config_without_attached_executor() {
     let (session, mut turn_context) = make_session_and_context().await;
-    turn_context.environment =
-        Arc::new(codex_exec_server::Environment::default().with_attached_executor(false));
+    turn_context.environment = Arc::new(
+        codex_exec_server::Environment::default()
+            .with_attached_executor(/*has_attached_executor*/ false),
+    );
 
     let rebuilt_turn = turn_context
         .with_model(

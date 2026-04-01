@@ -224,7 +224,8 @@ async fn exec_command_pre_tool_use_payload_uses_raw_command() {
 #[tokio::test]
 async fn exec_command_rejects_without_attached_executor() {
     let (session, mut turn) = make_session_and_context().await;
-    turn.environment = Arc::new(Environment::default().with_attached_executor(false));
+    turn.environment =
+        Arc::new(Environment::default().with_attached_executor(/*has_attached_executor*/ false));
     let handler = UnifiedExecHandler;
 
     let err = match handler
